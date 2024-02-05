@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+const (
+	errorColor     = "\033[1;31m"
+	successColor   = "\033[1;32m"
+	resetColor     = "\033[0m"
+	minResponseTime = 20.0
+)
+
 var verbose bool
 
 func readLines(filename string) ([]string, error) {
@@ -29,32 +36,42 @@ func readLines(filename string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
-func performRequest(url, data, cookie string) (bool, string) {
+func performRequest(url, data, cookie string, ch chan<- string, maxResponseTime float64) {
 	urlWithData := fmt.Sprintf("%s%s", url, data)
 	startTime := time.Now()
 
 	resp, err := http.Get(urlWithData)
 	if err != nil {
-		return false, fmt.Sprintf("\033[1;31mURL %s - Error: %s\033[0m", urlWithData, err)
+		ch <- fmt.Sprintf("%sURL %s - Error: %s%s", errorColor, urlWithData, err, resetColor)
+		return
 	}
 	defer resp.Body.Close()
 
 	responseTime := time.Since(startTime).Seconds()
 
-	if resp.StatusCode == http.StatusOK && responseTime > 20 {
-		vulnerabilityMsg := fmt.Sprintf("\033[1;31mURL %s - %.2f seconds - Vulnerable\033[0m", urlWithData, responseTime)
-		return true, vulnerabilityMsg
-	} else if verbose {
-		return false, fmt.Sprintf("\033[1;32mURL %s - %.2f seconds\033[0m", urlWithData, responseTime)
+	if found, result := isVulnerable(resp, responseTime, urlWithData, verbose, maxResponseTime); found {
+		ch <- result
 	}
+}
 
+func isVulnerable(resp *http.Response, responseTime float64, urlWithData string, verbose bool, maxResponseTime float64) (bool, string) {
+	if resp.StatusCode == http.StatusOK && isWithinResponseTimeRange(responseTime, maxResponseTime) {
+		return true, fmt.Sprintf("%sURL %s - %.2f seconds - Vulnerable%s", errorColor, urlWithData, responseTime, resetColor)
+	} else if verbose {
+		return false, fmt.Sprintf("%sURL %s - %.2f seconds%s", successColor, urlWithData, responseTime, resetColor)
+	}
 	return false, ""
+}
+
+func isWithinResponseTimeRange(responseTime, maxResponseTime float64) bool {
+	return responseTime >= minResponseTime && responseTime < maxResponseTime
 }
 
 func main() {
 	urlsFile := flag.String("u", "", "Text file with the URLs to which the GET request will be made.")
 	dataFile := flag.String("d", "", "Text file with the data that will be appended to the URLs.")
 	cookie := flag.String("C", "", "Cookie to include in the GET request.")
+	responseTimeFlag := flag.Float64("r", 22.0, "Maximum response time considered vulnerable.")
 	flag.BoolVar(&verbose, "v", false, "Show detailed information during execution.")
 	flag.Parse()
 
@@ -64,38 +81,33 @@ func main() {
 
 	urls, err := readLines(*urlsFile)
 	if err != nil {
-		log.Fatalf("Error reading the URLs file.: %s", err)
+		log.Fatalf("Error reading the URLs file: %s", err)
 	}
 
 	data, err := readLines(*dataFile)
 	if err != nil {
-		log.Fatalf("Error reading the data file.: %s", err)
+		log.Fatalf("Error reading the data file: %s", err)
 	}
 
 	var wg sync.WaitGroup
+	ch := make(chan string)
 
 	for _, url := range urls {
-		vulnerabilityFound := false
 		for _, d := range data {
 			wg.Add(1)
 			go func(url, d string) {
 				defer wg.Done()
-				if found, result := performRequest(url, d, *cookie); found {
-					// Set a flag to skip remaining iterations for this URL
-					vulnerabilityFound = true
-					// Print the vulnerability message
-					fmt.Println(result)
-				}
+				performRequest(url, d, *cookie, ch, *responseTimeFlag)
 			}(url, d)
-
-			// Check if vulnerability found
-			if vulnerabilityFound {
-				break
-			}
 		}
 	}
 
-	// Wait for all goroutines to finish
-	wg.Wait()
-}
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
 
+	for result := range ch {
+		log.Println(result)
+	}
+}
